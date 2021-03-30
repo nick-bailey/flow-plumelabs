@@ -1,0 +1,474 @@
+title: "Plume flow data"
+author: "Nick Bailey"
+date: "16/01/2021"
+output: html_document
+---
+
+# Analysis of data downloaded from Plume Flow2
+
+
+## Downloaded zip file structure
+
+Set up packages. 
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# load packages
+pacman::p_load(sf, vroom, lubridate, here, tidyverse)
+
+```
+
+
+Define some key lists, locations, polygons.
+
+```{r locations, include=FALSE}
+
+# pollutants
+pollutants <-       c("pm_10", "pm_2.5", "pm_1", 
+                      "NO2", "VOC")
+pollutants_plume <- c("pm_10_plume", "pm_2.5_plume", "pm_1_plume", 
+                      "NO2_plume", "VOC_plume")
+
+# locations - points used in analysis
+# - school - jn of Woodcroft and Edgehill
+sf_locs <- st_as_sf(data.frame(names =     c(   "home",  "school", "broom_nw", "broom_se"), 
+                               latitude =  c(55.880830, 55.879677, 55.881979, 55.875713), 
+                               longitude = c(-4.322144, -4.319765, -4.326233, -4.314522)),
+                    coords = c("longitude", "latitude"))
+st_crs(sf_locs) <- 4326
+
+
+# buffers round home and school
+# - first need to transform to appropriate CRS for st_buffer to work
+sf_locs_gb <- st_transform(sf_locs, crs = "EPSG:27700")  # locations with GB grid
+
+# home
+sf_home_50m <- st_buffer(sf_locs_gb[1,], dist = 50)
+sf_home_50m <- st_transform(sf_home_50m, 4326)   # back to lat/long
+# school 150m
+sf_school_150m <- st_buffer(sf_locs_gb[2,], dist = 150)
+sf_school_150m <- st_transform(sf_school_150m, 4326)   # back to lat/long
+# school 300m
+sf_school_300m <- st_buffer(sf_locs_gb[2,], dist = 300)
+sf_school_300m <- st_transform(sf_school_300m, 4326)   # back to lat/long
+
+
+# create Broomhill polygon and sf object
+broom_poly = st_polygon(list(rbind(c(-4.325908, 55.882598), 
+                               c(-4.314163, 55.880051), 
+                               c(-4.314145, 55.875598), 
+                               c(-4.326992, 55.875881), 
+                               c(-4.325908, 55.882598))))
+sf_broom = st_sfc(broom_poly, 
+                  crs = 4326)
+# plot(sf_broom)
+```
+
+Identify the most recent .zip file, then get structure and then file names.
+
+Zip file contains:
+
+* 'measures' file (csv) - air quality readings (N=5 in two formats) with date/time
+* 'positions' file (csv) - lat/long with date/time
+* 'positions' file (kml)
+* images directory with png file(s)
+
+```{r basics}
+
+# zip file - name of most recent .zip in 'data' directory
+# - doesn't work in one go for some reason
+zip_file <- data.frame(names = list.files(here("data"))) 
+zip_file <- zip_file %>%
+  cbind(file.info(here("data", zip_file$names))) %>%
+  filter(grepl("zip", names)) %>%
+  filter(mtime == max(mtime)) %>%
+  pull(names)
+
+# zip file structure
+zip_file_structure <- unzip(here("data", zip_file), list = TRUE) 
+
+# file name - 'measures' csv
+file_measures <- zip_file_structure %>%
+  filter(grepl("measures", Name)) %>%
+  pull(Name)
+
+# file name - 'positions' csv
+file_positions_csv <- zip_file_structure %>%
+  filter(grepl("positions", Name)) %>%
+  filter(grepl("csv", Name)) %>%
+  pull(Name)
+
+# file name - 'positions' kml
+file_positions_kml <- zip_file_structure %>%
+  filter(grepl("positions", Name)) %>%
+  filter(grepl("kml", Name)) %>%
+  pull(Name)
+
+
+```
+
+## Read in measures and positions data
+
+Note that the timings for which position is recorded are not the same as the timings for which measures are recorded so will need some approximation to join up. See below.  
+
+Measures file has timestamp and datetime, and then measures for each of the five items recorded in original units and on Plume's standardised scale. 
+
+```{r csv measures}
+
+# read 'measures' csv and tidy colnames
+#  NB bit clumsy but works
+df_meas <- vroom(map(file_measures, ~ unz(here("data", zip_file), .x))) %>%
+  rename(datetime = "date (UTC)") %>%
+  rename_with(~ sub(" (Plume AQI)", "_plume", .x, fixed = TRUE)) %>%
+  rename_with(~ sub(" (ppb)", "", .x, fixed = TRUE)) %>%
+  rename_with(~ sub(" (ug/m3)", "", .x, fixed = TRUE)) %>%
+  rename_with(~ sub(" ", "_", .x, fixed = TRUE))
+
+# datetime rounded to nearest whole minute - for joining
+df_meas <- df_meas %>% 
+  mutate(datetime_hm = round_date(datetime, unit = "minute"))
+
+# number of observations
+nrow(df_meas)
+
+```
+
+
+Positions from csv. Has lat/long but also timestamp and datetime (POSIXct). We need this as datetime not in the kml file. 
+
+```{r positions csv}
+
+# read 'positions' csv
+df_pos_csv <- vroom(map(file_positions_csv, ~ unz(here("data", zip_file), .x))) %>% 
+  rename(datetime = date)
+
+# summary
+str(df_pos_csv)
+
+
+```
+
+
+Positions from kml. Has only two fields (Name and Description) both of which appear to be empty so attach datetime from csv. 
+
+```{r positions kml}
+
+# read 'positions' kml
+sf_pos_kml <- read_sf(unzip(here("data", zip_file), files = file_positions_kml)) %>% 
+  cbind(df_pos_csv$datetime) %>% 
+  rename(datetime = df_pos_csv.datetime) 
+
+# datetime rounded to nearest whole minute - for joining
+sf_pos_kml <- sf_pos_kml %>% 
+  mutate(datetime_hm = round_date(datetime, unit = "minute"))
+
+# tidy up - delete folders+files created by unzip
+unlink("flow", recursive = TRUE)
+
+# quick plot
+plot(sf_pos_kml[1])   # to limit to one plot
+
+```
+
+Map of all data points with Broomhill boundary, and home + school marked. 
+
+``` {r map all}
+
+ggplot(data = sf_pos_kml) +
+  geom_sf(data = sf_broom, fill = NA) +
+  geom_sf(data = sf_locs[1:2,], size = 4, shape = 23, fill = "darkred") +
+  geom_sf(size = .5, alpha = .5) 
+    
+
+```
+
+
+Zoomed in to Broomhill neighbourhood with very rough Broomhill boundary. 
+
+``` {r map broomhill}
+
+sf_pos_kml %>% 
+  ggplot() +
+    geom_sf(data = sf_broom, fill = NA) +
+    geom_sf(data = sf_locs[1:2,], size = 4, shape = 23, fill = "darkred") +
+    geom_sf(fill = "blue", size = 2, alpha = 0.5)  +
+    coord_sf(xlim = c(-4.33, -4.31), ylim = c(55.875, 55.884), expand = FALSE)
+    
+```
+
+## Dates and times
+
+
+Days for which we have positional data. 
+
+``` {r fig days}
+
+sf_pos_kml %>% 
+  ggplot(aes(x = wday(datetime, week_start = 1, label = TRUE))) +
+  geom_bar() 
+  
+
+```
+Hours of the day for which we have positional data.
+
+``` {r fig hours}
+
+sf_pos_kml %>% 
+  ggplot(aes(x = hour(datetime))) +
+  geom_histogram(bins = 24)
+  
+
+```
+
+Minutes within the hour. 
+
+``` {r fig mins}
+
+sf_pos_kml %>% 
+  ggplot(aes(x = minute(datetime))) +
+  geom_histogram(bins = 60)
+  
+```
+And seconds. 
+
+``` {r fig secs}
+
+sf_pos_kml %>% 
+  ggplot(aes(x = second(datetime))) +
+  geom_histogram(bins = 60)
+  
+
+```
+
+Intervals between measure - (almost) always one minute.  
+
+``` {r fig interval meas}
+
+df_meas %>% 
+  mutate(interval_mins = round((datetime - lag(datetime))/60,0)) %>% 
+  ggplot(aes(x = interval_mins)) +
+  geom_bar() +
+  coord_cartesian(xlim = c(-100, 100))
+  
+
+```
+
+Intervals between positions in minutes. The large majority are one minute or less. 
+
+NB that difference between two times has class 'difftime' (measured in seconds but here converted to minutes). 
+
+``` {r fig interval pos}
+
+sf_pos_kml %>% 
+  mutate(interval_mins = round((datetime - lag(datetime))/60,0)) %>% 
+  ggplot(aes(x = interval_mins)) +
+  geom_bar() + 
+  coord_cartesian(xlim = c(0, 20))
+  
+
+```
+
+Number of position observations in the same minute. In most cases, there is more than one position record in each minute. So we lose a lot of positional date by aggregating to minutes - but then we only have measurements once per minute. 
+
+``` {r pos per min}
+
+df_pos_csv %>%
+  mutate(datetime_hm = round_date(datetime, unit = "minute")) %>% 
+  group_by(datetime_hm) %>% 
+  summarise(N = n()) %>%
+  ggplot(aes(x = N)) +
+  geom_histogram()
+
+```
+
+## Pollution data
+
+Boxplot of pollutants shows some extreme values, esp. PM 1 and VOCs. 
+
+``` {r pollutant}
+
+df_meas %>% 
+  pivot_longer(all_of(pollutants), names_to = "pollutant", values_to = "level") %>% 
+  ggplot(aes(y = level)) +
+  facet_wrap(~ pollutant, scales = "free") +
+  geom_boxplot()
+  
+
+```
+
+``` {r pollutant plume}
+
+df_meas %>% 
+  pivot_longer(all_of(pollutants_plume), names_to = "pollutant", values_to = "level") %>% 
+  ggplot(aes(x = pollutant, y = level)) +
+  geom_boxplot()
+  
+
+```
+Look at spread over time. there are a couple of real outlier days where some readings off the scale. 
+
+``` {r pollutant time, fig.height = 8, fig.width = 8}
+
+df_meas %>% 
+  pivot_longer(all_of(pollutants), names_to = "pollutant", values_to = "level") %>% 
+  mutate(date = round_date(datetime, unit = "hour")) %>% 
+  ggplot(aes(x = date, y = level, fill = pollutant)) +
+  geom_point(aes(colour = pollutant)) +
+  facet_wrap(~ pollutant, ncol = 1, scale = "free")
+  
+
+```
+
+Look at spread over time - plume version.
+
+``` {r pollutant time, fig.height = 8, fig.width = 8}
+
+df_meas %>% 
+  pivot_longer(all_of(pollutants_plume), names_to = "pollutant", values_to = "level") %>% 
+  mutate(date = round_date(datetime, unit = "hour")) %>% 
+  ggplot(aes(x = date, y = level, fill = pollutant)) +
+  geom_point(aes(colour = pollutant)) +
+  facet_wrap(~ pollutant, ncol = 1, scale = "free")
+  
+
+```
+
+## Joining pollution measures to position
+Easiest way to join is by rounding datetime in both position and measure databases to the nearest minute, and attaching the relevant measure record based on the same rounding. There will be multiple positions records with the same time in rounded minutes, each matched to the same measures record (since these are every minute). We therefore select the positions record which is nearest in timing to the relevant measures record (both measured to the second). 
+
+Note that this isn't necessarily the closest record in time since the rounding process could put that in a different group (by rounded minustes). And a more sophisticated approach would be to attach the measures records for timings either side of position timing, and interpolate a measure for the specific timing of the position. But that seems more work than necessary at the moment. 
+
+We can then make maps of pollution - here, PM10. 
+
+``` {r join pos meas}
+
+sf_pos_meas_kml <- sf_pos_kml %>% 
+  left_join(df_meas, by = "datetime_hm") %>%
+  mutate(datetime_diff = abs(datetime.x - datetime.y)) %>%    #abs value of diff
+  group_by(datetime_hm) %>% 
+  filter(datetime_diff == min(datetime_diff))
+
+sf_pos_meas_kml %>% 
+  ggplot() +
+  geom_sf(data = sf_broom, colour = "darkred", fill = NA) +
+  geom_sf(aes(colour = pm_10), size = 3) +
+  scale_colour_continuous(type = "viridis", direction = -1) +
+  geom_sf(data = sf_locs[1:2,], size = 3, shape = 23, fill = "darkred") 
+
+```
+
+## Points in Broomhill and around Broomhill School
+
+Identify points within school buffer and plot. 
+
+``` {r broomhill}
+
+# list of points in Broomhill or within school buffers 
+df_broom <- as.data.frame(st_within(sf_pos_meas_kml, sf_broom, sparse = FALSE)) %>%
+  rename(yn = V1)
+df_home_50m <- as.data.frame(st_within(sf_pos_meas_kml, sf_home_50m, sparse = FALSE)) %>%
+  rename(yn = V1)
+df_school_150m <- as.data.frame(st_within(sf_pos_meas_kml, sf_school_150m, sparse = FALSE)) %>%
+  rename(yn = V1)
+df_school_300m <- as.data.frame(st_within(sf_pos_meas_kml, sf_school_300m, sparse = FALSE)) %>%
+  rename(yn = V1)
+
+
+# map of points in Broomhill
+sf_pos_meas_kml %>% 
+  cbind(df_broom) %>%
+  filter(yn == 1) %>% 
+  ggplot() +
+  geom_sf(data = sf_broom, colour = "darkred", fill = NA) +
+  geom_sf(data = sf_home_50m, colour = "darkred", fill = NA) +
+  geom_sf(data = sf_school_300m, colour = "darkred", fill = NA) +
+  geom_sf(aes(colour = pm_10), size = 3) +
+  scale_colour_continuous(type = "viridis", direction = -1) +
+  geom_sf(data = sf_locs[1:2,], size = 3, shape = 23, fill = "darkred") +
+    coord_sf(xlim = c(-4.33, -4.31), ylim = c(55.875, 55.884), expand = FALSE)
+
+```
+
+``` {r broomhill}
+
+# map of points in 300m of school but not home
+sf_pos_meas_kml %>% 
+  cbind(df_school_300m) %>%
+  rename(yn_school = yn) %>% 
+  cbind(df_home_50m) %>%
+  rename(yn_home = yn) %>% 
+  filter(yn_school == 1 & yn_home == 0) %>% 
+  ggplot() +
+  geom_sf(data = sf_broom, colour = "darkred", fill = NA) +
+  geom_sf(data = sf_school_300m, colour = "darkred", fill = NA) +
+  geom_sf(aes(colour = pm_10), size = 3) +
+  scale_colour_continuous(type = "viridis", direction = -1) +
+  geom_sf(data = sf_locs[1:2,], size = 3, shape = 23, fill = "darkred") +
+    coord_sf(xlim = c(-4.33, -4.31), ylim = c(55.875, 55.884), expand = FALSE)
+
+```
+
+For points within school buffer but not home buffer, pollutants by time of day. 
+
+``` {r school time}
+
+# scatter points close to school by time of day
+sf_pos_meas_kml %>% 
+  cbind(df_school_300m) %>%
+  rename(yn_school = yn) %>% 
+  cbind(df_home_50m) %>%
+  rename(yn_home = yn) %>% 
+  filter(yn_school == 1 & yn_home == 0) %>% 
+  mutate(hours = hour(datetime.x) + minute(round_date(datetime.x, unit = "minute"))/60) %>%
+  filter(hours > 8.5 & hours < 9.5) %>% 
+  pivot_longer(all_of(pollutants_plume), names_to = "pollutant", values_to = "level") %>% 
+  ggplot(aes(x = hours, y = level)) +
+  geom_point(aes(colour = pollutant)) +
+  geom_smooth(aes(colour = pollutant), se = FALSE) 
+  
+```
+
+
+For points within school buffer but not home buffer, pollutants by time of day - facets. 
+
+``` {r school time}
+
+# scatter points close to school by time of day
+as.data.frame(sf_pos_meas_kml) %>% 
+  cbind(df_school_300m) %>%
+  rename(yn_school = yn) %>% 
+  cbind(df_home_50m) %>%
+  rename(yn_home = yn) %>% 
+  filter(yn_school == 1 & yn_home == 0) %>% 
+  mutate(hours = hour(datetime.x) + minute(round_date(datetime.x, unit = "minute"))/60) %>%
+  filter(hours > 8.5 & hours < 9.5) %>% 
+  pivot_longer(all_of(pollutants), names_to = "pollutant", values_to = "level") %>% 
+  ggplot(aes(x = hours, y = level)) +
+  geom_point(aes(colour = pollutant)) +
+  facet_wrap(~ pollutant, scales = "free") +
+  geom_smooth(aes(colour = pollutant), se = FALSE) 
+  
+```
+
+For points within school buffer but not home buffer, pollutants (Plume) by time of day - facets. 
+
+``` {r school time}
+
+# scatter points close to school by time of day
+as.data.frame(sf_pos_meas_kml) %>% 
+  cbind(df_school_300m) %>%
+  rename(yn_school = yn) %>% 
+  cbind(df_home_50m) %>%
+  rename(yn_home = yn) %>% 
+  filter(yn_school == 1 & yn_home == 0) %>% 
+  mutate(hours = hour(datetime.x) + minute(round_date(datetime.x, unit = "minute"))/60) %>%
+  filter(hours > 8.5 & hours < 9.5) %>% 
+  pivot_longer(all_of(pollutants_plume), names_to = "pollutant", values_to = "level") %>% 
+  ggplot(aes(x = hours, y = level)) +
+  geom_point(aes(colour = pollutant)) +
+  facet_wrap(~ pollutant, scales = "free") +
+  geom_smooth(aes(colour = pollutant), se = FALSE) 
+  
+```

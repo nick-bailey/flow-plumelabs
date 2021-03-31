@@ -1,10 +1,10 @@
-title: "Plume Flow 2 - data analysis"
+title: "Flow 2 - data analysis"
 author: "Nick Bailey"
 date: "16/01/2021"
 output: html_document
 ---
 
-# Analysis of data  from Plume Flow 2
+# Analysis of data  from Flow 2 by Plume Labs
 
 Flow 2 from Plume labs is a personal air quality sensor. Users can view data through a companion app but they can also download it for further analysis. This note shows an example of how the data can be imported and analysed. 
 
@@ -22,7 +22,7 @@ pacman::p_load(sf, vroom, lubridate, here, osmdata, ggmap, tidyverse)
 
 # lots of issues with OSM packages
 # - OpenStreetMap repeatedly failed to load
-# - read_osm - no available for this version of R
+# - read_osm - not available for this version of R
 
 ```
 
@@ -31,7 +31,7 @@ At the start, we define some key lists, locations, and polygons.
 
 ```{r locations, include=FALSE}
 
-# pollutants
+# pollutants - list of names for measures provided
 pollutants <-       c("pm_10", "pm_2.5", "pm_1", 
                       "NO2", "VOC")
 pollutants_plume <- c("pm_10_plume", "pm_2.5_plume", "pm_1_plume", 

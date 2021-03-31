@@ -1,0 +1,251 @@
+title: "Flow - sample data extraction"
+author: "Nick Bailey"
+date: "30/03/2021"
+output: html_document
+---
+
+
+# Creating public sample from personal data provided by Flow sensor
+## Nick Bailey - `r format(Sys.Date(), "%d/%m/%Y")`
+
+Flow 2 from Plume labs is a personal air quality sensor. Users can view data through a companion app but they can also download it for further analysis. 
+
+This file makes a sample from my full dataset to share publicly. It takes measures within a certain time window and locations (points) which fall within a given sample area. It saves the extract in a new zip file in the directory 'data' which can then be shared. This should have the same structure as the .zip file download. 
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE)
+
+# load packages
+pacman::p_load(sf, vroom, lubridate, here, hms, ggmap, tidyverse)
+
+```
+
+## Setting up
+Within the Flow app, users can go to 'Settings' and 'Export my data' to have a link emailed to them. This enables them to download all of the data they have generated to date. The data arrive in a .zip file. Here, I save this to the 'data-local-only' folder within this project (not shared). Older .zip files do not need to be removed - the code looks for the most recent zip file and uses that. 
+
+
+## Define sample dates/times
+I'm limitting the data to a few months in 2021 and to the hours between 8 and 10am. Later I restrict this to weekdays as well.
+
+```{r sample dates times}
+
+date_start <- "2021-02-01" 
+date_end   <- "2021-05-31"
+time_start <- "08:30:00"
+time_end   <- "09:15:00"
+
+```
+
+
+## Define sample area
+I used https://geojson.io/ to create a set of boundaries for my sample area, and saved these as a .kml file called 'sample_area.kml', shared in the 'geodata' folder. There are a number of sub-areas for later use but it is the first polygon which defines the whole sample area, based around Broomhill Primary School in Glasgow. 
+
+```{r sample area 1}
+
+# read in boundaries for study area and name
+sf_sample_area_kml <- read_sf(here("geodata", "sample_area.kml")) %>% 
+  mutate(Name = c("sample_area", "crow_road", "elmwood_lane", 
+                  "elmwood_randolph", "woodcroft_edgehill"), 
+         Name = factor(Name, 
+                       levels = c("sample_area", "crow_road", "elmwood_lane", 
+                                  "elmwood_randolph", "woodcroft_edgehill")))
+
+# plot polygons
+plot(sf_sample_area_kml[1])
+
+```
+
+
+With the GPS-based locations, there is a fair amount of noise or uncertainty so it is useful to create a buffer around the sample area polygon to capture points just outside it. 
+
+```{r sample area 2}
+
+# buffer distance (in meters)
+buffer_dist <- 20
+
+# take sample area polygon and transform to appropriate CRS for st_buffer to work
+sf_sample_area <- st_transform(sf_sample_area_kml[1,], crs = "EPSG:27700")  # locations with GB grid
+
+# make buffer around this and transform back to lat/long
+sf_sample_area <- st_buffer(sf_sample_area, dist = buffer_dist)
+sf_sample_area <- st_transform(sf_sample_area, 4326)   # back to lat/long
+
+# plot polygon
+plot(sf_sample_area[1])
+
+```
+
+## Get zip file structure and contents for downloaded data
+We identify the most recent .zip file in the 'data-local-only' folder, then read the structure and file names.
+
+The .zip file contains:
+
+* 'measures' (csv) - air quality readings with date/time (NB can be more than one of these)
+* 'positions' (csv) - lat/long with date/time
+* 'positions' (kml) - geospatial objects but no date/time
+* directory with png file(s) - not sure what these are
+
+```{r read files 1}
+
+# zip file - name of most recent .zip in 'data' directory
+# - doesn't work in one go for some reason
+zip_file <- data.frame(names = list.files(here("data-local-only"))) 
+zip_file <- zip_file %>%
+  cbind(file.info(here("data-local-only", zip_file$names))) %>%
+  filter(grepl("zip", names)) %>%
+  filter(mtime == max(mtime)) %>%
+  pull(names)
+
+# zip file structure
+zip_file_structure <- unzip(here("data-local-only", zip_file), list = TRUE) 
+
+head(zip_file_structure)
+
+```
+
+We then create lists with the relevant file names for measures and positions data, the latter in both csv and kml formats. Where there is more than one file of a given type (as with 'measures'), this captures all of them. 
+
+```{r read files 2}
+
+# file name - 'measures' csv
+# - NB returns more than one if relevant
+file_measures <- zip_file_structure %>%
+  filter(grepl("measures", Name)) %>%
+  pull(Name)
+
+# file name - 'positions' csv
+file_positions_csv <- zip_file_structure %>%
+  filter(grepl("positions", Name)) %>%
+  filter(grepl("csv", Name)) %>%
+  pull(Name)
+
+# file name - 'positions' kml
+file_positions_kml <- zip_file_structure %>%
+  filter(grepl("positions", Name)) %>%
+  filter(grepl("kml", Name)) %>%
+  pull(Name)
+
+
+```
+
+
+## Read in measures and limit to sample date/times
+With vroom, we can read multiple csv files from within the zip in one go (provided they have the same structure). Note that unzip ('unz') creates a directory 'flow' and puts files in there temporarily. 
+
+The 'measures' file has timestamp and datetime, and measures for each of the five air quality items, recorded in original units and on Plume's standardised scale. Note that measures are taken every minute, regardless of whether location is being recorded or not so there will be more records here than for location. 
+
+
+```{r measures 1}
+
+# read all 'measures' csv files
+df_meas <- vroom(map(file_measures, ~ unz(here("data-local-only", zip_file), .x))) 
+
+str(df_meas)
+
+```
+
+We cut this down to sample dates/times and restrict to weekdays.
+
+```{r measures 2}
+
+# reduce to study time period
+df_meas <- df_meas %>% 
+  filter(date(`date (UTC)`) >= date_start & 
+           date(`date (UTC)`) <= date_end &
+           wday(`date (UTC)`, week_start = 1) <= 5 &
+           as_hms(`date (UTC)`) >= as_hms(time_start) &
+           as_hms(`date (UTC)`) <= as_hms(time_end))
+
+nrow(df_meas)
+
+```
+
+## Read in locations data and limit to sample area
+
+The locations or positions are recorded when the Flow 2 is connected to the mobile phone via Bluetooth and the user has agreed to share location with Plume Labs. Locations are recorded in the 'positions' csv file which has lat/long but also datetime (in POSIXct format). We need these as the datetime is not present in the second (.kml) locations file. There should be the same number of records in each file. 
+
+```{r positions csv}
+
+# read 'positions' csv
+df_pos_csv <- vroom(map(file_positions_csv, ~ unz(here("data-local-only", zip_file), .x))) 
+
+str(df_pos_csv)
+
+```
+
+Locations are also recorded in the .kml file. Apart from the location information, it has two fields ('Name' and 'Description') both of which appear to be empty but no datetime field.  
+
+At this point, we delete the directory 'flow' to remove it and all the files within it. 
+
+```{r positions kml}
+
+# read 'positions' kml
+sf_pos_kml <- read_sf(unzip(here("data-local-only", zip_file), files = file_positions_kml)) 
+
+# tidy up - delete temp folders+files created by unzip
+unlink("flow", recursive = TRUE)
+
+str(sf_pos_kml)
+
+```
+
+
+We create a dataframe which identifies which points from the .kml file which fall within the sample area. 
+
+``` {r positions csv sample}
+
+# list of points in sample area buffer
+df_sample <- as.data.frame(st_within(sf_pos_kml, sf_sample_area, sparse = FALSE)) %>%
+  rename(yn = V1) 
+
+summary(df_sample)
+
+```
+
+
+We then cut the positions data (csv and kml) down to points in the sample area. Note that these are not necessarily in the sample dates/times. 
+
+``` {r positions kml sample}
+
+# points in sample area - csv
+df_pos_csv <- df_pos_csv %>% 
+  cbind(df_sample) %>%
+  filter(yn == 1) %>% 
+  select(-yn)
+
+# points in sample area - kml
+sf_pos_kml <- sf_pos_kml %>% 
+  cbind(df_sample) %>%
+  filter(yn == 1) %>% 
+  select(-yn)
+
+```
+
+
+## Zip the files
+
+Finally, we create a directory structure similar to the original zip file downloaded from Plume Labs, and write the sample data to this, then create a zip in the 'data' directory which can be shared. 
+
+``` {r write zip}
+
+# make directory 'flow' and sub-directory 'user'
+dir.create("flow")
+dir.create(here("flow", "user"))
+
+# write 'measures'
+write.csv(df_meas, here("flow", "user", "user_measures.csv"))
+
+# write 'postions' csv
+write.csv(df_pos_csv, here("flow", "user", "user_positions.csv"))
+
+# write 'postions' kml
+write_sf(sf_pos_kml, here("flow", "user", "user_positions.kml"))
+
+# create zip file in 'data' folder
+zip(zipfile = here("data", "sample.zip"), 
+    files = "flow")
+
+# remove directory 'flow'
+unlink("flow", recursive = TRUE)
+
+```
